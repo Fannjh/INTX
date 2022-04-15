@@ -6,7 +6,7 @@ it can greatly compress the CNN model.INTX based on TensorFlow2 development, and
 ## Toturial（TensorFlow2）
 ### model quantation
 ```python
-from nnq.quantization.quantizer import Quantizer
+from intx.quantization.quantizer import Quantizer
 #...
 model = YOLO3()
 input_layer = tf.keras.Input(shape=[416,416,3])
@@ -24,7 +24,7 @@ pred = model.inference(images_data)
 ```
 ### model pruning
 ```python
-from nnq.pruning.pruner import Pruner
+from intx.pruning.pruner import Pruner
 #...
 #1、build pruner model
 pruner = Pruner(strategy='gem',mode='pat',prune_percent=0.5)
