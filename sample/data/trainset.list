@@ -1,0 +1,2 @@
+#image_path left_top_x,left_top_y,right_down_x,right_down_y,class_index left_top_x,left_top_y,right_down_x,right_down_y,class_index
+COCO/train2017/000000106794.jpg 83,191,294,370,17 548,178,640,308,2 370,161,427,274,0 299,110,344,162,11

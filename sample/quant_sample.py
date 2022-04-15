@@ -1,0 +1,286 @@
+# !usr/bin/env python3
+# -*- coding:utf-8 -*-
+
+#############################################
+# FilePath: /INTX_Release/sample/quant_sample.py
+# Author: FanJH
+# Description: 
+#############################################
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+import time
+import shutil
+import sys
+sys.path.append('..')
+
+import cv2
+import numpy as np
+import tensorflow as tf
+from PIL import Image
+physical_devices = tf.config.experimental.list_physical_devices('GPU')
+for device in physical_devices:
+    tf.config.experimental.set_memory_growth(device,True)
+
+import utils
+from config import cfg
+from yolo import YOLOv3, YOLOv4
+from dataset import Dataset
+from intx.quantization.quantizer import Quantizer
+
+flags = tf.compat.v1.flags
+flags.DEFINE_string('model', 'yolov3', 'yolov3/yolov4')
+flags.DEFINE_boolean('isfreeze', False,'transfer learning, freeze yolo layer')
+flags.DEFINE_boolean('distribute', False,'use multi GPUs training')
+flags.DEFINE_string('resume','data/yolov3.weights','weights to restore')
+flags.DEFINE_string('image', 'data/kite.jpg', 'path to input image')
+flags.DEFINE_string('output', 'output/', 'path to output image')
+FLAGS = flags.FLAGS
+
+def demo():
+    classes = utils.read_class_names(cfg.YOLO.CLASSES)
+    num_class = len(classes)
+    input_size = 416
+    checkpoint = FLAGS.resume
+
+    # Build Model
+    input_layer  = tf.keras.layers.Input([input_size, input_size, 3])
+    if FLAGS.model == "yolov3":
+        conv_tensors = YOLOv3(input_layer,num_class)
+    else:
+        conv_tensors = YOLOv4(input_layer,num_class)
+    model = tf.keras.Model(input_layer, conv_tensors)
+    # model.summary()
+    if checkpoint.endswith(".weights"):
+        utils.load_weights(model,checkpoint,FLAGS.model)
+    elif os.path.exists(checkpoint+".index"):
+        model.load_weights(checkpoint)
+    else:
+        raise ValueError("checkpoint file %s not found."%checkpoint)
+    
+    # Process demo image
+    image_path   = "data/kite.jpg"
+    original_image      = cv2.imread(image_path)
+    original_image      = cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
+    original_image_size = original_image.shape[:2]
+    image_data = utils.image_preporcess(np.copy(original_image), [input_size, input_size])
+    image_data = image_data[np.newaxis, ...].astype(np.float32)
+
+    # Float32 model image demo
+    float_s_time = time.time()
+    conv_tensors = model(image_data,training=False)
+    float_e_time = time.time()
+    pred_bboxes = []
+    for scale_id, conv_tensor in enumerate(conv_tensors):
+        pred_bbox = utils.decode(conv_tensor,num_class,scale_id,FLAGS.model)
+        pred_bbox = tf.reshape(pred_bbox,(image_data.shape[0],-1,num_class+5))
+        pred_bboxes.append(pred_bbox)
+    pred_bboxes = tf.concat(pred_bboxes,axis=1)
+    bboxes = utils.postprocess_boxes(pred_bboxes[0],original_image_size,input_size,cfg.TEST.SCORE_THRESHOLD)
+    bboxes = utils.nms(bboxes, cfg.TEST.IOU_THRESHOLD, method='nms')
+
+    image = utils.draw_bbox(np.copy(original_image), bboxes)
+    image = Image.fromarray(image)
+    image.show()
+    if os.path.exists(FLAGS.output):
+        image.save(FLAGS.output+image_path.split('/')[-1].replace(".jpg","_FP32.jpg"))
+    # model.save("checkpoint/yolov3_savedmodel",save_format='tf')
+    #Quantized model
+    quantizer = Quantizer(strategy="minmax",mode="ptq",num_bits=8,signed=False)
+    qmodel = quantizer(model=model,model_type="tf",input_layer=input_layer)
+    testset = Dataset('test')
+    qmodel.calibrate(testset,sample_N=16)
+    int_s_time = time.time()
+    conv_tensors = qmodel.inference(image_data)
+    int_e_time = time.time()
+    pred_bboxes = []
+    for scale_id, conv_tensor in enumerate(conv_tensors):
+        pred_bbox = utils.decode(conv_tensor,num_class,scale_id,FLAGS.model)
+        pred_bbox = tf.reshape(pred_bbox,(image_data.shape[0],-1,num_class+5))
+        pred_bboxes.append(pred_bbox)
+    pred_bboxes = tf.concat(pred_bboxes,axis=1)
+    bboxes = utils.postprocess_boxes(pred_bboxes[0],original_image_size,input_size,cfg.TEST.SCORE_THRESHOLD)
+    bboxes = utils.nms(bboxes, cfg.TEST.IOU_THRESHOLD, method='nms')
+
+    image = utils.draw_bbox(np.copy(original_image), bboxes)
+    image = Image.fromarray(image)
+    image.show()
+    if os.path.exists(FLAGS.output):
+        image.save(FLAGS.output+image_path.split('/')[-1].replace(".jpg","_INT8.jpg"))
+    print("float32 inference cost time:%.4fs,int8 inference cost time:%.4fs."%
+                                        (float_e_time-float_s_time,int_e_time-int_s_time))
+    print("int8 inference acculate ratio is %.2f"%((float_e_time-float_s_time)/(int_e_time-int_s_time)))
+
+def generate_tflite():
+    classes = utils.read_class_names(cfg.YOLO.CLASSES)
+    num_class = len(classes)
+    input_size = 416
+    checkpoint = FLAGS.resume
+
+    # Build Model
+    input_layer  = tf.keras.layers.Input([input_size, input_size, 3])
+    if FLAGS.model == "yolov3":
+        conv_tensors = YOLOv3(input_layer,num_class)
+    else:
+        conv_tensors = YOLOv4(input_layer,num_class)
+    model = tf.keras.Model(input_layer, conv_tensors)
+    model.summary()
+    if checkpoint.endswith(".weights"):
+        utils.load_weights(model,checkpoint,FLAGS.model)
+    elif os.path.exists(checkpoint+".index"):
+        model.load_weights(checkpoint)
+    else:
+        raise ValueError("checkpoint file %s not found."%checkpoint)
+    
+    testset = Dataset('test')
+    def representative_data_gen():
+        for ind,(image,target) in enumerate(testset):
+            if ind > 512:
+                break
+            yield image
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+    converter.allow_custom_ops = True
+    # converter.inference_input_type = tf.uint8
+    # converter.inference_output_type = tf.uint8
+    converter.representative_dataset = representative_data_gen
+    tflite_model = converter.convert()
+    open("checkpoint/"+FLAGS.model+".tflite","wb").write(tflite_model)   
+
+def create_model(num_class):
+    input_size = 416
+    input_layer = tf.keras.layers.Input([input_size, input_size, 3])
+    if FLAGS.model == "yolov3":
+        conv_tensors = YOLOv3(input_layer,num_class)
+    else:
+        conv_tensors = YOLOv4(input_layer,num_class)
+    model = tf.keras.Model(input_layer, conv_tensors)
+    model.summary()
+    is_loaded = False
+    if FLAGS.resume.endswith(".weights"):
+        utils.load_weights(model,FLAGS.resume,FLAGS.model)
+        is_loaded = True
+    elif os.path.exists(FLAGS.resume+".index"):
+        model.load_weights(FLAGS.resume)
+        is_loaded = True
+    if is_loaded:
+        print('Restoring weights from: %s ' % (FLAGS.resume))
+
+    return input_layer,model
+
+def train():
+    trainset = Dataset('train')
+    testset = Dataset('test')
+    logdir = "data/log/"
+    steps_per_epoch = len(trainset)
+    first_stage_epochs = cfg.TRAIN.FIRST_STAGE_EPOCHS
+    second_stage_epochs = cfg.TRAIN.SECOND_STAGE_EPOCHS
+    global_steps = tf.Variable(1, trainable=False, dtype=tf.int64)
+    warmup_steps = cfg.TRAIN.WARMUP_EPOCHS * steps_per_epoch
+    total_steps = (first_stage_epochs+second_stage_epochs) * steps_per_epoch
+    freeze_layers = utils.load_freeze_layer()
+    num_class = len(utils.read_class_names(cfg.YOLO.CLASSES))
+    if os.path.exists(logdir): shutil.rmtree(logdir)
+    writer = tf.summary.create_file_writer(logdir)
+    def generate_data_fn(ctx):
+        for data in trainset:
+            return data
+    if FLAGS.distribute:
+        strategy = tf.distribute.MirroredStrategy()
+        with strategy.scope():
+            _,model = create_model(num_class)
+            optimizer = tf.keras.optimizers.Adam()
+            dist_trainset = strategy.experimental_distribute_values_from_function(generate_data_fn)
+    else:
+        input_layer,model = create_model(num_class)
+        # quantizer = Quantizer(strategy="minmax",mode="qat",num_bits=8,signed=False)
+        # model = quantizer(model=model,model_type="tf",input_layer=input_layer)
+        optimizer = tf.keras.optimizers.Adam()
+
+    def train_step(data):
+        image_data,target = data
+        with tf.GradientTape() as tape:
+            conv_tensors = model(image_data,training=True)
+            giou_loss=conf_loss=prob_loss=0.
+            for scale_id, conv_tensor in enumerate(conv_tensors):
+                pred_tensor = utils.decode(conv_tensor,num_class,scale_id,FLAGS.model)
+                loss_items = utils.compute_loss(pred_tensor,conv_tensor,*target[scale_id],num_class,scale_id)
+                giou_loss += loss_items[0]
+                conf_loss += loss_items[1]
+                prob_loss += loss_items[2]
+
+            total_loss = giou_loss + conf_loss + prob_loss
+            grads = tape.gradient(total_loss, model.trainable_variables)
+            optimizer.apply_gradients(zip(grads, model.trainable_variables))
+            if global_steps%20 == 0:
+                tf.print("TRAIN EPOCH:%2d,GLOBAL STEP:%4d/%4d,lr:%.6f,giou_loss:%4.2f,conf_loss:%4.2f,"
+                        "prob_loss:%4.2f,total_loss:%4.2f"% (global_steps//steps_per_epoch, global_steps,
+                                                                total_steps, optimizer.lr.numpy(),
+                                                                giou_loss, conf_loss,
+                                                                prob_loss, total_loss))
+            global_steps.assign_add(1)
+            if global_steps < warmup_steps:
+                lr = global_steps / warmup_steps * cfg.TRAIN.LR_INIT
+            else:
+                lr = cfg.TRAIN.LR_END + 0.5*(cfg.TRAIN.LR_INIT-cfg.TRAIN.LR_END)* \
+                                        (1+tf.cos((global_steps-warmup_steps)/(total_steps-warmup_steps)*np.pi))
+            optimizer.lr.assign(lr.numpy())
+        
+        with writer.as_default():
+            tf.summary.scalar("lr",optimizer.lr,step=global_steps)
+            tf.summary.scalar("train/toal_loss",total_loss,step=global_steps)
+            tf.summary.scalar("train/giou_loss", giou_loss, step=global_steps)
+            tf.summary.scalar("train/conf_loss", conf_loss, step=global_steps)
+            tf.summary.scalar("train/prob_loss", prob_loss, step=global_steps)
+        writer.flush()
+
+        return total_loss
+
+    def test_step(image_data,target):
+        conv_tensors = model(image_data,training=False)
+        giou_loss=conf_loss=prob_loss=0.
+        # optimizing process
+        for scale_id, conv_tensor in enumerate(conv_tensors):
+            pred_tensor = utils.decode(conv_tensor,num_class,scale_id)
+            loss_items = utils.compute_loss(pred_tensor,conv_tensor,*target[scale_id],num_class,scale_id)
+            giou_loss += loss_items[0]
+            conf_loss += loss_items[1]
+            prob_loss += loss_items[2]
+
+        total_loss = giou_loss + conf_loss + prob_loss
+        return total_loss
+
+    @tf.function
+    def dist_train_step():
+        per_replica_losses = strategy.run(train_step,args=(dist_trainset,))
+        return strategy.reduce(tf.distribute.ReduceOp.SUM,per_replica_losses,axis=None)
+
+    for epoch in range(first_stage_epochs+second_stage_epochs):
+        if FLAGS.isfreeze:
+            if epoch < first_stage_epochs:
+                utils.freeze(model,freeze_layers,frozen=True)
+            else:
+                utils.freeze(model,freeze_layers,frozen=False)
+        if FLAGS.distribute:
+            for step in range(steps_per_epoch):
+                dist_loss = dist_train_step()
+                tf.print("==>Dist Train, epoch:%02d, step:%5d, avg train loss:%.2f"%(epoch, step, dist_loss))
+        else:
+            for data in trainset:
+                train_step(data)
+                
+        test_loss = 0.
+        for image_data,target in testset:
+            test_loss += test_step(image_data,target)
+        avg_test_loss = test_loss / (len(testset)*cfg.TEST.BATCH_SIZE)
+        tf.print("TEST Finished, epoch:%02d, avg test loss:%.2f"%(epoch,avg_test_loss))
+
+        if (epoch+1)%5 == 0:
+            model.save_weights("checkpoint/epoch%02d_%.2f"%(epoch,avg_test_loss))
+
+def main():
+    demo()
+    # train()
+
+if __name__ == "__main__":
+    main()

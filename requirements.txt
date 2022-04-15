@@ -1,0 +1,12 @@
+absl==0.0
+absl_py==0.13.0
+easydict==1.9
+matplotlib==3.3.4
+numpy==1.19.5
+onnx==1.10.2
+onnxruntime==1.10.0
+opencv_python==4.1.2.30
+Pillow==9.1.0
+scipy==1.6.2
+tensorflow==2.4.1
+tf2onnx==1.9.3
